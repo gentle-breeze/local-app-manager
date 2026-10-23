@@ -1,0 +1,9 @@
+.local/
+__pycache__/
+dist/
+*.pyc
+evidence/
+.env
+.env.*
+*.log
+.DS_Store
