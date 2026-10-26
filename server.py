@@ -1,5 +1,6 @@
-import argparse, collections, fcntl, http.client, json, os, pathlib, re, secrets, signal, socket, subprocess, sys, threading, time
+import argparse, fcntl, hashlib, http.client, json, os, pathlib, re, secrets, signal, socket, subprocess, sys, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from lifecycle import LifecycleError, ManagedProcess, shutdown_config
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DEFAULTS = []  # Register applications through the UI; no machine-specific seeds.
@@ -57,17 +58,25 @@ class Manager:
         except BlockingIOError:
             self.lockfile.close()
             raise RuntimeError('此数据目录已有管理器运行')
+        self.guards = self.data/'unconfirmed'
+        self.guards.mkdir(mode=0o700, exist_ok=True)
         self.path = self.data/'apps.json'
         self.apps = json.loads(self.path.read_text()) if self.path.exists() else DEFAULTS.copy()
-        self.children, self.logs = {}, {}
+        self.children, self.logs, self.runtimes = {}, {}, {}
+        self.operations = {}
+        self.closed = False
         self.lock = threading.RLock()
 
     def save(self, app):
         with self.lock:
-            if set(app) - {'id','name','cwd','argv','port','health','readonly','logpath'}:
+            if set(app) - {'id','name','cwd','argv','port','health','readonly','logpath','stop_signal','stop_timeout','stop_policy'}:
                 raise ValueError('不支持的配置字段')
+            if self.closed:
+                raise LifecycleError('管理器正在退出')
+            app = app.copy()
+            app.update(shutdown_config(app))
             old = next((a for a in self.apps if a['id'] == app.get('id')), None)
-            if old and (self.running(old['id']) or old['readonly'] != bool(app.get('readonly', True))):
+            if old and (self.running(old['id']) or (old['id'] in self.operations and self.operations[old['id']].locked()) or old['readonly'] != bool(app.get('readonly', True))):
                 raise ValueError('只读或运行中的条目不可修改')
             if not isinstance(app.get('name'), str) or not 0 < len(app['name']) <= 80:
                 raise ValueError('请输入应用名称')
@@ -99,45 +108,57 @@ class Manager:
             os.replace(temp, self.path)
             self.apps = updated
 
+    def guard(self, ident):
+        return self.guards / hashlib.sha256(ident.encode()).hexdigest()
+
+    def runtime_state(self, ident):
+        runtime = self.runtimes.get(ident)
+        if runtime:
+            return runtime.snapshot()
+        uncertain = self.guard(ident).exists()
+        return dict(managed=uncertain, lifecycle='error' if uncertain else 'stopped',
+                    lifecycle_error='上次运行尚未确认停止；请人工核实，禁止重新启动' if uncertain else '', logs='')
+
     def running(self, ident):
-        child = self.children.get(ident)
-        return child is not None and child.poll() is None
+        return self.runtime_state(ident)['managed']
 
     def action(self, ident, action):
         with self.lock:
-            app = next((a for a in self.apps if a['id']==ident), None)
+            if self.closed:
+                raise LifecycleError('管理器正在退出')
+            app = next((a.copy() for a in self.apps if a['id']==ident), None)
             if not app or app['readonly']:
                 raise ValueError('只管理明确登记、由本管理器启动的应用')
             if action not in ('start','stop','restart'):
                 raise ValueError('未知操作')
-            if action in ('stop','restart') and self.running(ident):
-                self.children[ident].stdin.close()
-                self.children[ident].wait(timeout=5)
+            operation = self.operations.setdefault(ident, threading.Lock())
+            if not operation.acquire(blocking=False):
+                raise LifecycleError('应用正在执行启停操作；请等待本次操作完成')
+        try:
+            runtime = self.runtimes.get(ident)
+            if action in ('stop','restart'):
+                if runtime:
+                    runtime.stop()
+                elif self.guard(ident).exists():
+                    raise LifecycleError('上次运行尚未确认停止；没有可安全操作的进程句柄')
             if action in ('start','restart'):
-                if self.running(ident):
-                    raise ValueError('应用已经运行')
-                if app['port'] and probe(app)['reachable']:
-                    raise ValueError('端口已占用；不会接管既有进程')
-                env = {k:os.environ[k] for k in ('HOME','PATH','LANG','TMPDIR') if k in os.environ}
-                child = subprocess.Popen([sys.executable, str(ROOT/'supervisor.py')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
-                self.children[ident] = child
-                self.logs[ident] = buffer = collections.deque(maxlen=160)
-                child.stdin.write((json.dumps(app)+'\n').encode()); child.stdin.flush()
-                def collect():
-                    # Bounded reads even for a child emitting a giant line.
-                    while True:
-                        chunk = child.stdout.readline(2048)
-                        if not chunk: break
-                        text = chunk.decode('utf-8','replace')
-                        text = redact(text)
-                        with self.lock:
-                            buffer.append(text)
-                    child.stdout.close()
-                threading.Thread(target=collect, daemon=True).start()
+                with self.lock:
+                    if self.closed:
+                        raise LifecycleError('管理器正在退出')
+                    if self.running(ident):
+                        raise LifecycleError('应用尚未确认停止；不能重复启动')
+                    if app['port'] and probe(app)['reachable']:
+                        raise ValueError('端口已占用；不会接管既有进程')
+                    runtime = ManagedProcess(app, self.lockfile.fileno(), redact, self.guard(ident))
+                    self.runtimes[ident] = runtime
+                    self.children[ident] = runtime.child
+                    self.logs[ident] = runtime.logs
+        finally:
+            operation.release()
 
     def snapshot(self):
         with self.lock:
-            apps = [dict(a, managed=self.running(a['id']), logs=''.join(self.logs.get(a['id'], []))) for a in self.apps]
+            apps = [dict(a, **self.runtime_state(a['id'])) for a in self.apps]
         for app in apps:
             app.update(probe(app))
             if app.get('logpath'):
@@ -153,11 +174,27 @@ class Manager:
         return apps
 
     def close(self):
-        for child in list(self.children.values()):
-            if child.poll() is None:
-                child.stdin.close()
-                child.wait(timeout=5)
-        self.lockfile.close()
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            runtimes = list(self.runtimes.values())
+        # Notify every app before waiting on any; logs/status stay drainable.
+        try:
+            for runtime in runtimes:
+                try:
+                    runtime.request_stop(disconnect=True)
+                except (LifecycleError, OSError) as error:
+                    print('[manager] ' + str(error), file=sys.stderr)
+            for runtime in runtimes:
+                try:
+                    runtime.wait_stopped()
+                except (LifecycleError, OSError) as error:
+                    print('[manager] ' + str(error), file=sys.stderr)
+        finally:
+            # Live supervisors retain the lock; crashed supervisors leave their
+            # durable generation marker, so reopening cannot forget uncertainty.
+            self.lockfile.close()
 
 def serve(port=4320, data=ROOT/'.local'):
     manager = Manager(data)
@@ -197,6 +234,8 @@ def serve(port=4320, data=ROOT/'.local'):
                 elif self.path == '/api/action': manager.action(body['id'], body['action'])
                 else: return self.reply(404, {})
                 self.reply(200, {'ok':True})
+            except LifecycleError as error:
+                self.reply(409, {'error':str(error)})
             except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired):
                 self.reply(400, {'error':'操作未完成：请检查配置、只读状态与端口占用；运行中的条目不能编辑。'})
     try:
