@@ -132,6 +132,17 @@ class ManagedProcess:
             return dict(managed=self.state != 'stopped', lifecycle=self.state,
                         lifecycle_error=self.error, logs=''.join(self.logs))
 
+    def wait_started(self, timeout=5):
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while self.state == 'starting':
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LifecycleError('启动状态等待超时；保留监管，禁止重复启动')
+                self.condition.wait(remaining)
+            if self.state != 'running':
+                raise LifecycleError(self.error or '新进程未能保持运行；请检查启动命令与运行依赖')
+
     def request_stop(self, disconnect=False):
         with self.condition:
             if self.state == 'stopped':

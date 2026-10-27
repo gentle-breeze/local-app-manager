@@ -1,6 +1,7 @@
-import argparse, fcntl, hashlib, http.client, json, os, pathlib, re, secrets, signal, socket, subprocess, sys, threading, time
+import argparse, fcntl, hashlib, http.client, json, os, pathlib, re, secrets, shutil, signal, socket, subprocess, sys, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from lifecycle import LifecycleError, ManagedProcess, shutdown_config
+from deployment import DeploymentError, deployment_config, prepare_release
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DEFAULTS = []  # Register applications through the UI; no machine-specific seeds.
@@ -50,7 +51,7 @@ def probe(app):
 
 class Manager:
     def __init__(self, data):
-        self.data = pathlib.Path(data)
+        self.data = pathlib.Path(data).resolve()
         self.data.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.lockfile = open(self.data/'instance.lock', 'a')
         try:
@@ -60,21 +61,26 @@ class Manager:
             raise RuntimeError('此数据目录已有管理器运行')
         self.guards = self.data/'unconfirmed'
         self.guards.mkdir(mode=0o700, exist_ok=True)
+        self.prepare_guards = self.data/'unconfirmed-preparations'
+        self.prepare_guards.mkdir(mode=0o700, exist_ok=True)
         self.path = self.data/'apps.json'
         self.apps = json.loads(self.path.read_text()) if self.path.exists() else DEFAULTS.copy()
         self.children, self.logs, self.runtimes = {}, {}, {}
         self.operations = {}
+        self.deployments = {}
+        self.active_apps = {}
         self.closed = False
         self.lock = threading.RLock()
 
     def save(self, app):
         with self.lock:
-            if set(app) - {'id','name','cwd','argv','port','health','readonly','logpath','stop_signal','stop_timeout','stop_policy'}:
+            if set(app) - {'id','name','cwd','argv','port','health','readonly','logpath','stop_signal','stop_timeout','stop_policy','github_url','build_argv'}:
                 raise ValueError('不支持的配置字段')
             if self.closed:
                 raise LifecycleError('管理器正在退出')
             app = app.copy()
             app.update(shutdown_config(app))
+            app.update(deployment_config(app))
             old = next((a for a in self.apps if a['id'] == app.get('id')), None)
             if old and (self.running(old['id']) or (old['id'] in self.operations and self.operations[old['id']].locked()) or old['readonly'] != bool(app.get('readonly', True))):
                 raise ValueError('只读或运行中的条目不可修改')
@@ -134,8 +140,47 @@ class Manager:
             operation = self.operations.setdefault(ident, threading.Lock())
             if not operation.acquire(blocking=False):
                 raise LifecycleError('应用正在执行启停操作；请等待本次操作完成')
+        prepared = None
+        launched = False
         try:
             runtime = self.runtimes.get(ident)
+            if not runtime and self.guard(ident).exists():
+                raise LifecycleError('上次运行尚未确认停止；没有可安全操作的进程句柄')
+            preparation_guard = self.prepare_guards / self.guard(ident).name
+            if action in ('start', 'restart') and preparation_guard.exists():
+                raise LifecycleError('上次准备进程尚未确认退出；请人工核实，禁止部署')
+            if action == 'start' and self.running(ident):
+                raise LifecycleError('应用尚未确认停止；不能重复启动')
+            if action in ('start', 'restart') and app.get('github_url'):
+                if runtime and runtime.snapshot()['lifecycle'] == 'error':
+                    raise LifecycleError('停止状态未确认；禁止部署')
+                def phase(value):
+                    with self.lock:
+                        self.deployments.setdefault(ident, {}).update(
+                            deployment_phase=value, deployment_error='')
+                deployment_config(app)  # Revalidate before creating a crash barrier.
+                fd = os.open(preparation_guard, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'w') as marker:
+                    json.dump(dict(app_id=ident), marker)
+                    marker.flush()
+                    os.fsync(marker.fileno())
+                cleanup_confirmed = False
+                try:
+                    app, commit = prepare_release(app, self.data, phase)
+                    prepared = app['cwd']
+                    cleanup_confirmed = True
+                    phase('ready')
+                except DeploymentError as error:
+                    cleanup_confirmed = error.cleanup_confirmed
+                    with self.lock:
+                        self.deployments.setdefault(ident, {}).update(
+                            deployment_phase='error', deployment_error=str(error))
+                    raise
+                finally:
+                    if cleanup_confirmed:
+                        preparation_guard.unlink()
+            else:
+                commit = None
             if action in ('stop','restart'):
                 if runtime:
                     runtime.stop()
@@ -149,18 +194,44 @@ class Manager:
                         raise LifecycleError('应用尚未确认停止；不能重复启动')
                     if app['port'] and probe(app)['reachable']:
                         raise ValueError('端口已占用；不会接管既有进程')
+                    launched = True  # Retain source if launch outcome becomes uncertain.
                     runtime = ManagedProcess(app, self.lockfile.fileno(), redact, self.guard(ident))
                     self.runtimes[ident] = runtime
+                    self.active_apps[ident] = app
                     self.children[ident] = runtime.child
                     self.logs[ident] = runtime.logs
+                    if commit:
+                        self.deployments.setdefault(ident, {}).update(
+                            previous_commit=self.deployments.get(ident, {}).get('deployed_commit', ''),
+                            previous_cwd=self.deployments.get(ident, {}).get('deployed_cwd', ''))
+                        runtime.wait_started()
+                        self.deployments.setdefault(ident, {}).update(
+                            deployment_phase='launched', deployed_commit=commit,
+                            deployed_cwd=app['cwd'], deployment_error='')
+        except (LifecycleError, OSError, ValueError) as error:
+            if app.get('github_url') and action in ('start', 'restart'):
+                with self.lock:
+                    self.deployments.setdefault(ident, {}).update(
+                        deployment_phase='error', deployment_error=str(error))
+            raise
         finally:
+            if prepared and not launched:
+                shutil.rmtree(prepared)
             operation.release()
 
     def snapshot(self):
         with self.lock:
-            apps = [dict(a, **self.runtime_state(a['id'])) for a in self.apps]
+            apps = [dict(a, **self.runtime_state(a['id']), **self.deployments.get(a['id'], {})) for a in self.apps]
         for app in apps:
-            app.update(probe(app))
+            preparation_guard = self.prepare_guards / self.guard(app['id']).name
+            operation = self.operations.get(app['id'])
+            if preparation_guard.exists() and not (operation and operation.locked()):
+                app.update(deployment_phase='error',
+                           deployment_error='上次准备进程尚未确认退出；请人工核实，禁止部署')
+            if app.get('deployment_phase') == 'launched' and app['lifecycle'] in ('stopped', 'error'):
+                app.update(deployment_phase='exited',
+                           deployment_error='上次拉取版本的进程已退出或状态异常；不代表部署健康，请查看日志')
+            app.update(probe(dict(app, cwd=self.active_apps.get(app['id'], app)['cwd'])))
             if app.get('logpath'):
                 try:
                     fd = os.open(app['logpath'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
