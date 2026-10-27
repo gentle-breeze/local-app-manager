@@ -56,7 +56,7 @@ class DeploymentTests(unittest.TestCase):
         env = dict(PATH=os.environ['PATH'], HOME=str(home), GIT_CONFIG_NOSYSTEM='1',
                    GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0')
         return deployment._run(['git', '-c', 'protocol.file.allow=always', *args],
-                               cwd, env, '拉取 main')
+                               cwd, env, '拉取配置分支')
 
     def write_version(self, repo, version):
         (repo / 'app.py').write_text("import time\nprint(%r, flush=True)\nwhile True: time.sleep(.1)\n" % version)
@@ -110,7 +110,7 @@ class DeploymentTests(unittest.TestCase):
         old = self.manager.runtimes[ident]
         repo = pathlib.Path(self.remotes['https://github.com/example/one'])
         git(repo, 'branch', '-m', 'not-main')
-        with self.assertRaisesRegex(deployment.DeploymentError, '拉取 main失败'):
+        with self.assertRaisesRegex(deployment.DeploymentError, '拉取配置分支失败'):
             self.manager.action(ident, 'restart')
         self.assertIs(self.manager.runtimes[ident], old)
         self.assertEqual(old.snapshot()['lifecycle'], 'running')
@@ -295,6 +295,51 @@ class DeploymentTests(unittest.TestCase):
         app = dict(self.manager.apps[-1], build_argv=[])
         self.manager.save(app)
         self.manager.action(ident, 'start'); self.wait_log(ident, 'one')
+
+    def test_default_branch_and_legacy_config(self):
+        self.assertEqual(deployment.deployment_config({})['github_branch'], 'main')
+        self.assertEqual(deployment.deployment_config({'github_branch': ''})['github_branch'], 'main')
+        ident = self.app()
+        self.manager.apps[-1].pop('github_branch')  # Pre-feature persisted entry.
+        self.manager.action(ident, 'start'); self.wait_log(ident, 'one')
+
+    def test_configured_slash_branch_is_fetched_independently_per_project(self):
+        repo = pathlib.Path(self.remotes['https://github.com/example/one'])
+        git(repo, 'checkout', '-b', 'release/stable')
+        self.write_version(repo, 'stable branch version')
+        stable = self.app(github_branch='release/stable')
+        main = self.app(github_branch='main')
+        other = self.app('two', github_branch='main')
+        for ident, message in ((stable, 'stable branch version'), (main, 'one'), (other, 'two')):
+            self.manager.action(ident, 'start'); self.wait_log(ident, message)
+        self.assertEqual(self.manager.deployments[stable]['deployed_commit'], git(repo, 'rev-parse', 'release/stable'))
+        self.assertEqual(self.manager.deployments[main]['deployed_commit'], git(repo, 'rev-parse', 'main'))
+        self.assertNotEqual(self.manager.deployments[stable]['deployed_commit'], self.manager.deployments[main]['deployed_commit'])
+        saved = __import__('json').loads(self.manager.path.read_text())
+        self.assertEqual(next(a for a in saved if a['id'] == stable)['github_branch'], 'release/stable')
+
+    def test_missing_configured_branch_does_not_stop_old_service(self):
+        repo = pathlib.Path(self.remotes['https://github.com/example/one'])
+        git(repo, 'branch', 'release/stable')
+        ident = self.app(github_branch='release/stable')
+        self.manager.action(ident, 'start'); self.wait_log(ident, 'one')
+        old = self.manager.runtimes[ident]
+        git(repo, 'branch', '-D', 'release/stable')
+        with self.assertRaisesRegex(deployment.DeploymentError, '拉取配置分支失败'):
+            self.manager.action(ident, 'restart')
+        self.assertIs(self.manager.runtimes[ident], old)
+        self.assertEqual(old.snapshot()['lifecycle'], 'running')
+
+    def test_invalid_branch_names_rejected_before_fetch(self):
+        invalid = [None, 12, [], '--upload-pack=x', '-bad', 'a:b', 'a*b', 'a?b',
+                   'a^b', 'a~b', 'a[b', 'a\\b', 'a b', 'a\n', 'a\0b',
+                   'a..b', '../main', 'a//b', '/main', 'main/', '.hidden',
+                   'a/.hidden', 'a.lock', 'a.lock/b', 'a.', '@', 'a@{b}', 'a' * 201]
+        for branch in invalid:
+            with self.subTest(branch=branch), self.assertRaises(ValueError):
+                self.app(github_branch=branch)
+        self.assertFalse(list(self.manager.prepare_guards.iterdir()))
+        self.assertFalse((self.manager.data / 'releases').exists())
 
     def test_timeout_is_explicit(self):
         with self.assertRaisesRegex(deployment.DeploymentError, '构建超时'):

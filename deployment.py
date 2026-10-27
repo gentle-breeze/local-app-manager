@@ -1,4 +1,4 @@
-"""Opt-in, anonymous GitHub main deployments in independent release directories."""
+"""Opt-in, anonymous GitHub branch deployments in independent release directories."""
 import os
 import pathlib
 import re
@@ -30,6 +30,17 @@ def deployment_config(app):
         raise ValueError('GitHub 地址必须是无凭据的 https://github.com/owner/repo 地址')
     if url and any(part in ('.', '..') for part in url.split('/')[-2:]):
         raise ValueError('GitHub 仓库地址无效')
+    branch = app.get('github_branch', 'main')
+    if not isinstance(branch, str):
+        raise ValueError('部署分支必须是字符串')
+    branch = branch or 'main'
+    # Restrict to a documented, safe subset of git-check-ref-format names.
+    # Always fetch a fully qualified heads ref: no option/refspec/revision syntax.
+    if (not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}', branch) or
+            '..' in branch or branch.endswith('.') or
+            any(not part or part.startswith('.') or part.endswith('.lock')
+                for part in branch.split('/'))):
+        raise ValueError('部署分支格式无效：使用字母、数字、_、-、. 或 /，不能含空白、..、隐藏路径或 .lock 后缀')
     build = app.get('build_argv', [])
     if (not isinstance(build, list) or len(build) > 40 or
             any(not isinstance(v, str) or len(v) > 1024 or '\0' in v for v in build) or
@@ -39,7 +50,7 @@ def deployment_config(app):
         raise ValueError('构建命令需要 GitHub 地址')
     if url and app.get('readonly', True):
         raise ValueError('只读观察条目不能配置远程部署')
-    return dict(github_url=url[:-4] if url.endswith('.git') else url, build_argv=build)
+    return dict(github_url=url[:-4] if url.endswith('.git') else url, github_branch=branch, build_argv=build)
 
 
 def _run(args, cwd, env, phase, timeout=300):
@@ -114,7 +125,7 @@ def _git(args, cwd, home):
     return _run(['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null',
                  '-c', 'protocol.file.allow=never', '-c', 'protocol.ext.allow=never',
                  '-c', 'http.followRedirects=false', '-c', 'gc.auto=0',
-                 '-c', 'maintenance.auto=false', *args], cwd, env, '拉取 main')
+                 '-c', 'maintenance.auto=false', *args], cwd, env, '拉取配置分支')
 
 
 def release_argv(argv, source, release):
@@ -159,7 +170,7 @@ def prepare_release(app, data, phase):
         with tempfile.TemporaryDirectory(prefix='git-home-') as home:
             _git(['init', '--quiet', str(release)], releases, home)
             _git(['fetch', '--quiet', '--depth=1', '--no-tags', config['github_url'],
-                  'refs/heads/main'], release, home)
+                  'refs/heads/' + config['github_branch']], release, home)
             commit = _git(['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], release, home)
             _git(['checkout', '--quiet', '--detach', commit], release, home)
         deployed = dict(app, cwd=str(release), argv=release_argv(app['argv'], app['cwd'], release))

@@ -74,7 +74,7 @@ class Manager:
 
     def save(self, app):
         with self.lock:
-            if set(app) - {'id','name','cwd','argv','port','health','readonly','logpath','stop_signal','stop_timeout','stop_policy','github_url','build_argv'}:
+            if set(app) - {'id','name','cwd','argv','port','health','readonly','logpath','stop_signal','stop_timeout','stop_policy','github_url','github_branch','build_argv'}:
                 raise ValueError('不支持的配置字段')
             if self.closed:
                 raise LifecycleError('管理器正在退出')
